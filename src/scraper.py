@@ -75,14 +75,17 @@ class Scraper:
         return estates_quantity
 
     def parse_estate(self, estate_post):
-        # find div with anything data-qa atributte
-        data_qa = estate_post.find_all('div', attrs={'data-qa': True})
+        # Zonaprop moved many fields from <div> to <h2>/<h3>.
+        # Don't restrict to any tag type, just look for data-qa.
+        data_qa = estate_post.find_all(attrs={'data-qa': True})
         url = estate_post.get_attribute_list('data-to-posting')[0]
         estate = {}
         estate['url'] = url
         for data in data_qa:
             label = data['data-qa']
             text = None
+            if label.startswith('CARD_') or label in {'POSTING_CARD_PUBLISHER'}:
+                continue
             if label in ['POSTING_CARD_PRICE', 'expensas']:
                 currency_value, currency_type = self.parse_currency_value(data.get_text())
                 estate[LABEL_DICT[label] + '_' + 'value'] = currency_value
@@ -117,17 +120,79 @@ class Scraper:
 
     def parse_features(self, text):
 
-        features_matches = re.compile(r'(\d+\.?\d*)\s(\w+)').findall(text)
+        def normalize_number(raw: str) -> str:
+            raw = raw.strip()
+            # handle thousand separators and decimal comma
+            raw = raw.replace('.', '').replace(',', '.')
+            return raw
 
-        features_appearance = {'square_meters_area': 0, 'rooms': 0, 'bedrooms': 0, 'bathrooms': 0, 'parking' : 0}
+        def normalize_unit(raw: str) -> str:
+            raw = raw.strip().lower()
+            raw = raw.rstrip('.')
+            # normalize common variants
+            if raw in {'m²', 'm2'}:
+                return 'm²'
+            if raw in {'amb', 'ambs'}:
+                return 'amb'
+            if raw in {'dorm', 'dorms'}:
+                return 'dorm'
+            if raw in {'baño', 'baños'}:
+                return 'baños'
+            if raw in {'coch', 'cocheras'}:
+                return 'coch'
+            return raw
+
+        def area_kind(qualifier: str | None) -> str | None:
+            if not qualifier:
+                return None
+            q = qualifier.strip().lower().rstrip('.')
+            if q.startswith('tot'):
+                return 'square_meters_total'
+            if q.startswith('cub'):
+                return 'square_meters_covered'
+            if q.startswith('terr'):
+                return 'square_meters_land'
+            return None
+
+        # Examples seen in the wild:
+        # "771 m² tot. | 8 amb. | 4 dorm. | 3 baños | 1 coch."
+        # We parse number + unit + optional qualifier for m².
+        pattern = re.compile(
+            r'(\d+(?:[\.,]\d+)*)\s*'
+            r'(m²|m2|amb\.?|dorm\.?|baños?|baño|coch\.?)(?:\s*(tot\.?|totales|cub\.?|cubiertos|terr\.?|terreno))?',
+            flags=re.IGNORECASE,
+        )
+
+        features_appearance = {
+            'square_meters_area': 0,
+            'square_meters_total': 0,
+            'square_meters_covered': 0,
+            'square_meters_land': 0,
+            'rooms': 0,
+            'bedrooms': 0,
+            'bathrooms': 0,
+            'parking': 0,
+        }
 
         features = {}
+        for raw_value, raw_unit, raw_qual in pattern.findall(text):
+            value = normalize_number(raw_value)
+            unit = normalize_unit(raw_unit)
 
-        for feature in features_matches:
-            try:
-                feature_unit = f'{FEATURE_UNIT_DICT[feature[1]]}_{features_appearance[FEATURE_UNIT_DICT[feature[1]]]}'
-                features_appearance[FEATURE_UNIT_DICT[feature[1]]] += 1
-            except:
-                feature_unit = feature[1]
-            features[feature_unit] = feature[0]
+            if unit == 'm²':
+                base_key = area_kind(raw_qual) or 'square_meters_area'
+            else:
+                base_key = FEATURE_UNIT_DICT.get(unit)
+
+            if not base_key:
+                # Unknown unit; keep something usable.
+                base_key = unit
+
+            idx = features_appearance.get(base_key)
+            if idx is None:
+                features[base_key] = value
+            else:
+                features[f'{base_key}_{idx}'] = value
+                features_appearance[base_key] += 1
+
         return features
